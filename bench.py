@@ -55,27 +55,59 @@ def extract_terms(doc_text, cap=100):
         if a.lower() not in STOP: cands[a] += 1
     return [t for t, n in cands.most_common(cap * 3) if n >= 2][:cap]
 
-def ten_k_text(company, ua, before="2021-06-30"):
-    h = {"User-Agent": ua}
-    tickers = json.loads(fetch("https://www.sec.gov/files/company_tickers.json", headers=h))
-    want = set(re.findall(r"[a-z]+", company.lower())) - {"inc", "corp", "corporation", "co", "the", "company"}
-    best = max(tickers.values(), key=lambda t: len(want & set(re.findall(r"[a-z]+", t["title"].lower()))) / max(1, len(want)))
-    sub = json.loads(fetch(f"https://data.sec.gov/submissions/CIK{int(best['cik_str']):010d}.json", headers=h))
-    r = sub["filings"]["recent"]
-    ks = [(r["filingDate"][i], r["accessionNumber"][i], r["primaryDocument"][i]) for i, f in enumerate(r["form"]) if f == "10-K"]
-    if not ks: return best["title"], ""
-    early = [k for k in ks if k[0] <= before]; d, acc, doc = (max(early) if early else min(ks))
-    url = f"https://www.sec.gov/Archives/edgar/data/{int(best['cik_str'])}/{acc.replace('-', '')}/{doc}"
-    time.sleep(0.2)
-    raw = fetch(url, headers=h); text = html.unescape(re.sub(r"<[^>]+>", " ", raw))
-    return f"{best['title']} 10-K filed {d}", text
+FORMS = ("10-K", "20-F", "40-F")
+SEARCH_AS = {"Nextar Media Group": "Nexstar Media Group"}
+SUFFIX = r"\b(inc|corp|corporation|co|company|ltd|plc|se|nv|n\.v|llc|lp|l\.p)\b\.?"
 
-def transcribe(audio, keyterms):
-    q = [("model", "nova-3"), ("punctuate", "true")] + [("keyterm", t) for t in keyterms]
-    req = urllib.request.Request("https://api.deepgram.com/v1/listen?" + urllib.parse.urlencode(q), data=audio, method="POST",
-                                 headers={"Authorization": f"Token {os.environ['DEEPGRAM_API_KEY']}", "Content-Type": "audio/mpeg"})
-    j = json.loads(urllib.request.urlopen(req, timeout=900).read())
-    return j["results"]["channels"][0]["alternatives"][0]["transcript"]
+def toks(name):
+    return set(re.findall(r"[a-z]+", re.sub(SUFFIX, " ", name.lower())))
+
+def candidates(company, ua):
+    h = {"User-Agent": ua}; name = SEARCH_AS.get(company, company); want = toks(name); found = []
+    try:
+        tickers = json.loads(fetch("https://www.sec.gov/files/company_tickers.json", headers=h)).values()
+        found += [int(t["cik_str"]) for t in sorted(tickers, key=lambda t: -len(want & toks(t["title"])))[:5] if want & toks(t["title"])]
+    except Exception: pass
+    q = re.sub(r"\s+", " ", re.sub(SUFFIX, " ", name, flags=re.I)).strip(" ,.")
+    atom = fetch("https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&owner=include&count=40&output=atom&company=" + urllib.parse.quote(q), headers=h)
+    found += [int(m.group(1) or m.group(2)) for m in re.finditer(r"<cik>0*(\d+)</cik>|CIK=0*(\d+)", atom)]
+    return list(dict.fromkeys(found))[:15]
+
+def ten_k_text(company, ua, lo="2019-01-01", hi="2021-06-30"):
+    h = {"User-Agent": ua}; want = toks(SEARCH_AS.get(company, company)); best = None
+    for cik in candidates(company, ua):
+        try: sub = json.loads(fetch(f"https://data.sec.gov/submissions/CIK{cik:010d}.json", headers=h))
+        except Exception: continue
+        r = sub["filings"]["recent"]
+        ks = [(r["filingDate"][i], r["accessionNumber"][i], r["primaryDocument"][i], f) for i, f in enumerate(r["form"]) if f in FORMS and lo <= r["filingDate"][i] <= hi]
+        time.sleep(0.15)
+        if not ks: continue
+        have = toks(sub.get("name", "")); score = len(want & have) / max(1, len(want | have))
+        if best is None or score > best[0]: best = (score, cik, sub.get("name", company), max(ks))
+    if best is None or best[0] < 0.5: return f"no matching annual report for {company}", ""
+    _, cik, filer, (d, acc, doc, form) = best
+    raw = fetch(f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc.replace('-', '')}/{doc}", headers=h)
+    return f"{filer} {form} filed {d}", html.unescape(re.sub(r"<[^>]+>", " ", raw))
+
+SENT = {}
+
+def transcribe(audio, keyterms, tag=None):
+    terms = [re.sub(r"[^A-Za-z0-9&.' -]", "", t).strip() for t in keyterms]
+    terms = [t for t in terms if t]
+    while True:
+        q = [("model", "nova-3"), ("punctuate", "true")] + [("keyterm", t) for t in terms]
+        req = urllib.request.Request("https://api.deepgram.com/v1/listen?" + urllib.parse.urlencode(q), data=audio, method="POST",
+                                     headers={"Authorization": f"Token {os.environ['DEEPGRAM_API_KEY']}", "Content-Type": "audio/mpeg"})
+        try:
+            j = json.loads(urllib.request.urlopen(req, timeout=900).read())
+            if tag: SENT[tag] = len(terms)
+            return j["results"]["channels"][0]["alternatives"][0]["transcript"]
+        except urllib.error.HTTPError as e:
+            reason = e.read()[:300].decode("utf-8", "replace")
+            if e.code == 400 and len(terms) > 10:
+                print(f"    Deepgram refused {len(terms)} keyterms ({reason}); retrying with {len(terms) // 2}", flush=True)
+                terms = terms[: len(terms) // 2]; continue
+            raise SystemExit(f"Deepgram {e.code}: {reason}")
 
 def term_recall(terms, ref, hyp):
     tot = hit = 0
@@ -97,8 +129,10 @@ def main(limit):
             cf = cache / f"{fid}-{name}.txt"
             if not cf.exists():
                 audio = audio or fetch(RAW + f"media/{fid}.mp3", binary=True)
-                cf.write_text(transcribe(audio, kt), encoding="utf-8"); print(f"  {company} {name}: transcribed", flush=True)
+                cf.write_text(transcribe(audio, kt, f"{fid}-{name}"), encoding="utf-8"); (cache / f"{fid}-{name}.n").write_text(str(SENT.get(f"{fid}-{name}", len(kt)))); print(f"  {company} {name}: transcribed", flush=True)
             res[name], res["n_occ"] = term_recall(evalset, ref, cf.read_text(encoding="utf-8"))
+        for nm, key in (("auto_10k", "sent_auto"), ("oracle", "sent_oracle")):
+            nf = cache / f"{fid}-{nm}.n"; res[key] = int(nf.read_text()) if nf.exists() else len(conds[nm])
         res["auto_overlap"] = len({t.lower() for t in auto} & {t.lower() for t in evalset})
         rows.append(res); print(f"  {company}: none {res['none']:.3f} | auto {res['auto_10k']:.3f} | oracle {res['oracle']:.3f}", flush=True)
     occ = sum(r["n_occ"] for r in rows)
@@ -109,8 +143,8 @@ def main(limit):
           "| Keyterms | Rare-word recall |", "|---|---|",
           f"| None | {agg['none']:.3f} |", f"| Auto, from each company's 10-K | {agg['auto_10k']:.3f} |", f"| Oracle, Rev's list | {agg['oracle']:.3f} |", "",
           f"**Automatic keyterms recovered {100 * recov:.0f}% of the oracle's gain.**", "",
-          "| Call | Company | 10-K used | none | auto | oracle |", "|---|---|---|---|---|---|"]
-    md += [f"| {r['file']} | {r['company']} | {r['source']} | {r['none']:.3f} | {r['auto_10k']:.3f} | {r['oracle']:.3f} |" for r in rows]
+          "| Call | Company | 10-K used | Keyterms sent, auto / oracle | none | auto | oracle |", "|---|---|---|---|---|---|---|"]
+    md += [f"| {r['file']} | {r['company']} | {r['source']} | {r.get('sent_auto', '?')} / {r.get('sent_oracle', '?')} | {r['none']:.3f} | {r['auto_10k']:.3f} | {r['oracle']:.3f} |" for r in rows]
     md += ["", "## Honest limits", "",
            "- Recall counts term occurrences in the reference and the transcript, capped per term. It doesn't align words, so a term transcribed in the wrong place still counts.",
            "- The oracle list comes from the reference transcripts themselves, so it's an upper bound no real deployment gets.",
